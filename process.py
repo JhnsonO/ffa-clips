@@ -3,31 +3,43 @@ FFA Clip Generator
   Detect only:
     Single cam:  python process.py --input video.mp4 --output output/
     Multi cam:   python process.py --input folder/ --multi --output output/
+
+Detection uses OpenAI Vision on sampled frames.
+Set OPENAI_API_KEY in your environment before running.
 """
 
-import sys, json, argparse, subprocess, struct, wave, tempfile, shutil
+import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
 
 CFG = {
-    "clip_pre":          6,
-    "clip_post":         10,
-    "min_gap":           8,
-    "audio_threshold":   2.5,
-    "motion_threshold":  0.15,
-    "output_res":        "1920x1080",
-    "output_crf":        23,
-    "switch_interval":   3.0,
+    "clip_pre": 6,
+    "clip_post": 10,
+    "min_gap": 30,
+    "audio_threshold": 2.5,
+    "motion_threshold": 0.4,
+    "output_res": "1920x1080",
+    "output_crf": 23,
+    "switch_interval": 3.0,
+    "vision_sample_every": 5,
+    "vision_timeout_sec": 60,
 }
 
 
-def ff(cmd):
-    r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return r.stdout + r.stderr
+def ff(args):
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return r.returncode, r.stdout + r.stderr
 
 
 def duration(path):
-    out = ff(f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{path}"')
+    code, out = ff([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+    if code != 0:
+        return None
     try:
         return float(out.strip().splitlines()[-1])
     except:
@@ -35,7 +47,16 @@ def duration(path):
 
 
 def extract_wav(video, wav, sr=16000):
-    ff(f'ffmpeg -y -i "{video}" -ac 1 -ar {sr} -vn "{wav}"')
+    code, out = ff([
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-ac", "1",
+        "-ar", str(sr),
+        "-vn",
+        str(wav),
+    ])
+    if code != 0:
+        raise RuntimeError(out)
 
 
 def read_wav(path):
@@ -76,35 +97,94 @@ def merge(timestamps, gap):
     return out
 
 
-def audio_events(video_path, output_dir):
-    wav = output_dir / "_tmp_audio.wav"
-    extract_wav(video_path, wav)
-    samples, sr = read_wav(wav)
-    wav.unlink(missing_ok=True)
-    wins = rms_windows(samples, sr)
-    return merge(spikes(wins, CFG["audio_threshold"]), CFG["min_gap"])
+def sample_frames(video_path, output_dir, every_sec):
+    frames_dir = output_dir / "_vision_frames"
+    if frames_dir.exists():
+        for old in frames_dir.glob("*.jpg"):
+            old.unlink(missing_ok=True)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern = frames_dir / "frame_%06d.jpg"
+    code, out = ff([
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-vf", f"fps=1/{every_sec}",
+        "-q:v", "2",
+        str(pattern),
+    ])
+    if code != 0:
+        raise RuntimeError(out)
+
+    frames = []
+    for i, frame_path in enumerate(sorted(frames_dir.glob("frame_*.jpg"))):
+        frames.append((i * every_sec, frame_path))
+    return frames
 
 
-def motion_events(video_path):
-    out = ff(
-        f'ffmpeg -i "{video_path}" '
-        f'-vf "select=gt(scene\\,{CFG["motion_threshold"]}),metadata=print:file=-" '
-        f'-an -f null -'
+def ask_vision_yes_no(frame_path, api_key):
+    prompt = (
+        "This is a frame from a 7-a-side football match. "
+        "Does this frame show an exciting moment — a goal, shot, skill, tackle, or celebration? "
+        "Reply with just YES or NO."
     )
-    times = []
-    for line in out.splitlines():
-        if "pts_time:" in line:
-            try:
-                times.append(float(line.split("pts_time:")[-1].split()[0]))
-            except:
-                pass
-    return merge(times, CFG["min_gap"])
+    b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 3,
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=CFG["vision_timeout_sec"]) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    text = data["choices"][0]["message"]["content"].strip().upper()
+    return text.startswith("YES")
+
+
+def vision_events(video_path, output_dir):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        sys.exit("ERROR: OPENAI_API_KEY is not set in the environment.")
+
+    frames = sample_frames(video_path, output_dir, CFG["vision_sample_every"])
+    yes_times = []
+
+    print(f"  Vision sampling: {len(frames)} frames ({CFG['vision_sample_every']}s interval)")
+    for t, frame_path in frames:
+        try:
+            is_exciting = ask_vision_yes_no(frame_path, api_key)
+        except urllib.error.HTTPError as e:
+            details = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Vision API HTTP {e.code}: {details}")
+        except Exception as e:
+            raise RuntimeError(f"Vision API request failed: {e}")
+
+        status = "YES" if is_exciting else "NO "
+        print(f"  [{status}] {int(t//60)}:{int(t%60):02d}  {frame_path.name}")
+        if is_exciting:
+            yes_times.append(float(t))
+
+    return merge(yes_times, CFG["min_gap"])
 
 
 def all_events(video_path, output_dir):
-    ae = audio_events(video_path, output_dir)
-    me = motion_events(video_path)
-    return merge(sorted(set(ae + me)), CFG["min_gap"])
+    return vision_events(video_path, output_dir)
 
 
 def make_meta(name, t, cam, idx):
@@ -185,7 +265,7 @@ def multi_mode(input_dir, output_dir):
         print(f"  {mp4s[i].name}: offset {off:+.1f}s vs reference")
         offsets.append(off)
 
-    print("  Detecting events on reference camera...")
+    print("  Detecting events on reference camera with OpenAI Vision...")
     events = all_events(mp4s[0], output_dir)
     print(f"  Events detected: {len(events)}")
 
@@ -228,7 +308,7 @@ def main():
         "source": source,
         "clips": clips,
     }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"\n✓ Detection complete: {len(clips)} candidate clips")
     print(f"✓ Manifest written: {out / 'manifest.json'}")
     print("✓ Open review.html in your browser to review clips from source video.")
