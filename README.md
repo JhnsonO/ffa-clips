@@ -1,6 +1,6 @@
 # FFA Clip Generator
 
-Automatically finds and cuts highlights from your kickabout footage.
+Automatically finds highlight moments from your kickabout footage, lets you review them fast, then exports only the clips you approve.
 
 ## First Time Setup
 
@@ -13,27 +13,18 @@ Automatically finds and cuts highlights from your kickabout footage.
 1. Double-click `run.bat`
 2. Choose mode 1 (single camera) or 2 (multi-camera)
 3. Drag your MP4 file or folder in when prompted
-4. Wait for processing (5–15 min depending on video length)
+4. Wait for detection to finish
 5. The review page opens in your browser automatically
-6. Load `output/manifest.json` when prompted, then select the `output/clips/` folder
-7. Approve the clips you want to keep, skip the rest
-8. Export list shows exactly which files to post
+6. Load `output/manifest.json`
+7. Select the original source video or source folder
+8. Approve the clips you want to keep
+9. Click **Export Approved** in the browser to download `approved_manifest.json`
+10. Double-click `export.bat` and provide `approved_manifest.json`
 
 ## Output
 
-All clips are saved to `output/clips/` as standard MP4 files ready to drag into Instagram, TikTok, or YouTube Shorts.
+Approved clips are exported to `output/clips/`.
 
-## Camera Setup
-
-| Mode | Use when |
-|------|----------|
-| Single | One camera, any source (Chameleon recommended) |
-| Multi  | 2–3 cameras in a folder, auto-synced by audio |
-
-## Tuning (optional)
-
-Edit `process.py` top section `CFG = { ... }` to adjust:
-- `clip_pre` / `clip_post` — how many seconds before/after each event
-- `audio_threshold` — sensitivity for crowd/impact noise (lower = more clips)
-- `motion_threshold` — sensitivity for scene changes (lower = more clips)
-- `min_gap` — minimum seconds between separate events
+- Single-cam export tries `-c copy` first for near-instant cutting
+- If the requested cut is not near a keyframe, it falls back to `libx264`
+- Multi-cam export still uses stitched export on approval
