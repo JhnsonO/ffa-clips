@@ -19,17 +19,21 @@ CFG = {
 }
 
 
-def ff(cmd):
-    r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def ff(args):
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
 def nearest_keyframe_delta(video, start_sec):
-    cmd = (
-        f'ffprobe -v error -skip_frame nokey -select_streams v:0 '
-        f'-show_frames -show_entries frame=pts_time -of csv=p=0 "{video}"'
-    )
-    code, out = ff(cmd)
+    code, out = ff([
+        "ffprobe", "-v", "error",
+        "-skip_frame", "nokey",
+        "-select_streams", "v:0",
+        "-show_frames",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=p=0",
+        str(video),
+    ])
     if code != 0:
         return None
     best = None
@@ -48,19 +52,32 @@ def nearest_keyframe_delta(video, start_sec):
 
 
 def export_copy(video, start, dur, out_path):
-    cmd = f'ffmpeg -y -ss {start:.3f} -i "{video}" -t {dur:.3f} -c copy "{out_path}"'
-    return ff(cmd)
+    return ff([
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(video),
+        "-t", f"{dur:.3f}",
+        "-c", "copy",
+        str(out_path),
+    ])
 
 
 def export_reencode(video, start, dur, out_path):
     res = CFG["output_res"]
     crf = CFG["output_crf"]
-    cmd = (
-        f'ffmpeg -y -ss {start:.3f} -i "{video}" -t {dur:.3f} '
-        f'-vf "scale={res}:force_original_aspect_ratio=decrease,pad={res}:(ow-iw)/2:(oh-ih)/2" '
-        f'-c:v libx264 -crf {crf} -preset fast -c:a aac -b:a 128k "{out_path}"'
-    )
-    return ff(cmd)
+    return ff([
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(video),
+        "-t", f"{dur:.3f}",
+        "-vf", f"scale={res}:force_original_aspect_ratio=decrease,pad={res}:(ow-iw)/2:(oh-ih)/2",
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", "fast",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(out_path),
+    ])
 
 
 def extract_clip(video, start, dur, out_path):
@@ -88,14 +105,23 @@ def multicam_clip(vids_offsets, event_time, clip_pre, clip_post, out_path):
             vid, offset = vids_offsets[cam_idx % len(vids_offsets)]
             local_start = max(0, (event_time - clip_pre + t) - offset)
             seg_out = tmpdir / f"seg{len(seg_files):03d}.mp4"
-            export_reencode(vid, local_start, seg_dur, seg_out)
+            code, out = export_reencode(vid, local_start, seg_dur, seg_out)
+            if code != 0:
+                raise RuntimeError(out)
             seg_files.append(seg_out)
             t += seg_dur
             cam_idx += 1
 
         concat = tmpdir / "list.txt"
         concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in seg_files), encoding="utf-8")
-        code, out = ff(f'ffmpeg -y -f concat -safe 0 -i "{concat}" -c copy "{out_path}"')
+        code, out = ff([
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat),
+            "-c", "copy",
+            str(out_path),
+        ])
         if code != 0:
             raise RuntimeError(out)
     finally:
