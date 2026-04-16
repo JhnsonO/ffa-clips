@@ -1,70 +1,49 @@
 @echo off
 title FFA Clip Generator
 echo.
-echo ============================================
-echo  FFA Clip Generator
-
-echo  Detect only + review in browser
-
-echo ============================================
+echo FFA Clip Generator
 echo.
-echo  Modes:
-echo    1. Single camera (one MP4 file)
-echo    2. Multi camera  (folder with 2-3 MP4s)
+echo Choose detection mode:
+echo   1. Vision highlight detection
+echo   2. Goal detection (local YOLO)
 echo.
-set /p MODE="Choose mode (1 or 2): "
+set /p MODE="Enter mode (1 or 2): "
 
-if "%MODE%"=="1" goto single
-if "%MODE%"=="2" goto multi
-echo Invalid choice. Please enter 1 or 2.
-pause
-exit /b 1
+if "%MODE%"=="1" goto vision
+if "%MODE%"=="2" goto goals
+echo Invalid mode selected.
+goto end
 
-:single
+:vision
 echo.
-echo Drag and drop your MP4 file here, then press Enter:
-set /p INPUT="Video file: "
+set /p INPUT="Drag your MP4 file or folder here: "
 set INPUT=%INPUT:"=%
-echo.
-set OUTPUT=output
-echo Running single-cam detection...
-echo.
-python process.py --input "%INPUT%" --output "%OUTPUT%" --watch
-goto done
+set /p MULTI="Multi-cam? (y/n): "
+if /i "%MULTI%"=="y" (
+    python process.py --input "%INPUT%" --multi --output output --watch
+) else (
+    python process.py --input "%INPUT%" --output output --watch
+)
+goto after_run
 
-:multi
+:goals
 echo.
-echo Drag and drop the FOLDER containing your MP4s here, then press Enter:
-set /p INPUT="Folder: "
+set /p INPUT="Drag your GoPro MP4 file here: "
 set INPUT=%INPUT:"=%
-echo.
-set OUTPUT=output
-echo Running multi-cam detection with audio sync...
-echo.
-python process.py --input "%INPUT%" --output "%OUTPUT%" --multi --watch
-goto done
+python detect_goals.py --input "%INPUT%" --output output
+goto after_run
 
-:done
+:after_run
 echo.
 if errorlevel 1 (
     echo [ERROR] Something went wrong. Check the output above.
-    pause
-    exit /b 1
+    goto end
 )
 echo ============================================
 echo  Done! Opening review page...
 echo ============================================
 echo.
-echo In the review page:
-echo   1. Load output\manifest.json
-echo   2. Select the original source video or source folder
-    
-echo   3. Approve clips
-    
-echo   4. Click Export Approved and save approved_manifest.json
-    
-echo   5. Run export.bat
-
-echo.
 start "" review.html
+
+:end
 pause
