@@ -4,11 +4,11 @@ FFA Clip Generator
     Single cam:  python process.py --input video.mp4 --output output/
     Multi cam:   python process.py --input folder/ --multi --output output/
 
-Detection uses OpenAI Vision on sampled frames.
+Detection uses OpenAI Vision via the Batch API.
 Set OPENAI_API_KEY in your environment before running.
 """
 
-import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error
+import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error, uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -23,7 +23,15 @@ CFG = {
     "switch_interval": 3.0,
     "vision_sample_every": 5,
     "vision_timeout_sec": 60,
+    "coarse_interval": 15,
+    "refine_interval": 2,
 }
+
+VISION_PROMPT = (
+    "This is a frame from a 7-a-side football match. "
+    "Does this frame show an exciting moment — a goal, shot, skill, tackle, or celebration? "
+    "Reply with just YES or NO."
+)
 
 
 def ff(args):
@@ -90,6 +98,7 @@ def spikes(windows, stddevs):
 def merge(timestamps, gap):
     if not timestamps:
         return []
+    timestamps = sorted(timestamps)
     out = [timestamps[0]]
     for t in timestamps[1:]:
         if t - out[-1] > gap:
@@ -97,90 +106,333 @@ def merge(timestamps, gap):
     return out
 
 
-def sample_frames(video_path, output_dir, every_sec):
-    frames_dir = output_dir / "_vision_frames"
+def progress_path(output_dir):
+    return output_dir / "progress.json"
+
+
+def load_progress(output_dir):
+    path = progress_path(output_dir)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except:
+        return None
+
+
+def save_progress(output_dir, data):
+    progress_path(output_dir).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def require_api_key():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        sys.exit("ERROR: OPENAI_API_KEY is not set in the environment.")
+    return api_key
+
+
+def openai_json_request(method, path, api_key, body=None):
+    req = urllib.request.Request(
+        f"https://api.openai.com{path}",
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=CFG["vision_timeout_sec"]) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def openai_upload_file(file_path, api_key):
+    boundary = f"----FFAClipBoundary{uuid.uuid4().hex}"
+    file_bytes = file_path.read_bytes()
+    parts = []
+    parts.append(f"--{boundary}\r\n".encode("utf-8"))
+    parts.append(b'Content-Disposition: form-data; name="purpose"\r\n\r\n')
+    parts.append(b"batch\r\n")
+    parts.append(f"--{boundary}\r\n".encode("utf-8"))
+    parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\n'.encode("utf-8")
+    )
+    parts.append(b"Content-Type: application/jsonl\r\n\r\n")
+    parts.append(file_bytes)
+    parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    data = b"".join(parts)
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/files",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=CFG["vision_timeout_sec"]) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def openai_create_batch(input_file_id, api_key):
+    return openai_json_request(
+        "POST",
+        "/v1/batches",
+        api_key,
+        {
+            "input_file_id": input_file_id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        },
+    )
+
+
+def openai_get_batch(batch_id, api_key):
+    return openai_json_request("GET", f"/v1/batches/{batch_id}", api_key)
+
+
+def openai_download_file(file_id, api_key):
+    req = urllib.request.Request(
+        f"https://api.openai.com/v1/files/{file_id}/content",
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=CFG["vision_timeout_sec"]) as resp:
+        return resp.read().decode("utf-8")
+
+
+def batch_status_text(batch):
+    status = batch.get("status", "unknown")
+    if status == "failed":
+        return f"failed: {batch.get('errors')}"
+    return status
+
+
+def sample_frames(video_path, output_dir, every_sec, prefix, width=512, quality=10):
+    frames_dir = output_dir / f"_vision_frames_{prefix}"
     if frames_dir.exists():
         for old in frames_dir.glob("*.jpg"):
             old.unlink(missing_ok=True)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    pattern = frames_dir / "frame_%06d.jpg"
+    pattern = frames_dir / f"{prefix}_%06d.jpg"
     code, out = ff([
         "ffmpeg", "-y",
         "-i", str(video_path),
-        "-vf", f"fps=1/{every_sec}",
-        "-q:v", "2",
+        "-vf", f"fps=1/{every_sec},scale={width}:-2",
+        "-q:v", str(quality),
         str(pattern),
     ])
     if code != 0:
         raise RuntimeError(out)
 
     frames = []
-    for i, frame_path in enumerate(sorted(frames_dir.glob("frame_*.jpg"))):
-        frames.append((i * every_sec, frame_path))
+    for i, frame_path in enumerate(sorted(frames_dir.glob(f"{prefix}_*.jpg"))):
+        frames.append((round(i * every_sec, 3), frame_path))
     return frames
 
 
-def ask_vision_yes_no(frame_path, api_key):
-    prompt = (
-        "This is a frame from a 7-a-side football match. "
-        "Does this frame show an exciting moment — a goal, shot, skill, tackle, or celebration? "
-        "Reply with just YES or NO."
-    )
-    b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
-    body = {
-        "model": "gpt-4o",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                ],
+def sample_frame_at(video_path, timestamp, frame_path, width=512, quality=10):
+    code, out = ff([
+        "ffmpeg", "-y",
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", f"scale={width}:-2",
+        "-q:v", str(quality),
+        str(frame_path),
+    ])
+    if code != 0:
+        raise RuntimeError(out)
+
+
+def refine_timestamps_from_yes(yes_times, video_path):
+    vid_dur = duration(video_path) or 0
+    times = []
+    seen = set()
+    for t in yes_times:
+        start = max(0, int(t - 30))
+        end = int(t + 30)
+        cur = start
+        while cur <= end:
+            ts = round(float(cur), 3)
+            if vid_dur and ts > vid_dur:
+                break
+            if ts not in seen:
+                seen.add(ts)
+                times.append(ts)
+            cur += CFG["refine_interval"]
+    return sorted(times)
+
+
+def build_refine_frames(video_path, output_dir, timestamps):
+    frames_dir = output_dir / "_vision_frames_refine"
+    if frames_dir.exists():
+        for old in frames_dir.glob("*.jpg"):
+            old.unlink(missing_ok=True)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = []
+    for i, ts in enumerate(timestamps):
+        frame_path = frames_dir / f"refine_{i+1:06d}.jpg"
+        sample_frame_at(video_path, ts, frame_path)
+        frames.append((ts, frame_path))
+    return frames
+
+
+def build_batch_jsonl(frames, output_dir, name):
+    jsonl_path = output_dir / f"{name}.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for i, (ts, frame_path) in enumerate(frames):
+            b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+            req = {
+                "custom_id": f"{name}_{i:06d}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": VISION_PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{b64}",
+                                        "detail": "low",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                    "max_tokens": 3,
+                    "temperature": 0,
+                },
             }
-        ],
-        "max_tokens": 3,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=CFG["vision_timeout_sec"]) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    text = data["choices"][0]["message"]["content"].strip().upper()
-    return text.startswith("YES")
+            f.write(json.dumps(req) + "\n")
+    return jsonl_path
+
+
+def submit_batch_for_frames(frames, output_dir, name, api_key):
+    jsonl_path = build_batch_jsonl(frames, output_dir, name)
+    upload = openai_upload_file(jsonl_path, api_key)
+    batch = openai_create_batch(upload["id"], api_key)
+    return batch["id"]
+
+
+def collect_yes_from_batch(batch_id, timestamps, api_key):
+    batch = openai_get_batch(batch_id, api_key)
+    status = batch.get("status")
+    if status != "completed":
+        return status, None
+    output_file_id = batch.get("output_file_id")
+    if not output_file_id:
+        raise RuntimeError("Batch completed but no output_file_id was returned.")
+
+    content = openai_download_file(output_file_id, api_key)
+    yes_times = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        custom_id = row.get("custom_id", "")
+        try:
+            idx = int(custom_id.rsplit("_", 1)[-1])
+        except:
+            continue
+        if idx < 0 or idx >= len(timestamps):
+            continue
+
+        body = ((row.get("response") or {}).get("body") or {})
+        text = ""
+        try:
+            text = body["choices"][0]["message"]["content"].strip().upper()
+        except:
+            text = ""
+        if text.startswith("YES"):
+            yes_times.append(float(timestamps[idx]))
+    return status, sorted(yes_times)
 
 
 def vision_events(video_path, output_dir):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        sys.exit("ERROR: OPENAI_API_KEY is not set in the environment.")
+    api_key = require_api_key()
+    progress = load_progress(output_dir)
 
-    frames = sample_frames(video_path, output_dir, CFG["vision_sample_every"])
-    yes_times = []
+    if progress and progress.get("stage") == "complete":
+        return merge(progress.get("yes_timestamps", []), CFG["min_gap"])
 
-    print(f"  Vision sampling: {len(frames)} frames ({CFG['vision_sample_every']}s interval)")
-    for t, frame_path in frames:
-        try:
-            is_exciting = ask_vision_yes_no(frame_path, api_key)
-        except urllib.error.HTTPError as e:
-            details = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Vision API HTTP {e.code}: {details}")
-        except Exception as e:
-            raise RuntimeError(f"Vision API request failed: {e}")
+    if not progress:
+        coarse_frames = sample_frames(video_path, output_dir, CFG["coarse_interval"], "coarse")
+        coarse_timestamps = [t for t, _ in coarse_frames]
+        print(f"  Coarse scan: {len(coarse_frames)} frames ({CFG['coarse_interval']}s interval)")
+        batch_id = submit_batch_for_frames(coarse_frames, output_dir, "coarse_batch", api_key)
+        save_progress(output_dir, {
+            "stage": "coarse_submitted",
+            "batch_id": batch_id,
+            "coarse_timestamps": coarse_timestamps,
+            "refine_timestamps": [],
+            "yes_timestamps": [],
+        })
+        print(f"  Coarse batch submitted: {batch_id}")
+        sys.exit("Batch submitted. Run the script again later to collect results.")
 
-        status = "YES" if is_exciting else "NO "
-        print(f"  [{status}] {int(t//60)}:{int(t%60):02d}  {frame_path.name}")
-        if is_exciting:
-            yes_times.append(float(t))
+    stage = progress.get("stage")
+    batch_id = progress.get("batch_id")
 
-    return merge(yes_times, CFG["min_gap"])
+    if stage == "coarse_submitted":
+        batch = openai_get_batch(batch_id, api_key)
+        status = batch.get("status")
+        if status != "completed":
+            sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
+
+        _, coarse_yes = collect_yes_from_batch(batch_id, progress.get("coarse_timestamps", []), api_key)
+        coarse_yes = sorted(coarse_yes or [])
+        if not coarse_yes:
+            save_progress(output_dir, {
+                "stage": "complete",
+                "batch_id": batch_id,
+                "coarse_timestamps": progress.get("coarse_timestamps", []),
+                "refine_timestamps": [],
+                "yes_timestamps": [],
+            })
+            return []
+
+        refine_timestamps = refine_timestamps_from_yes(coarse_yes, video_path)
+        refine_frames = build_refine_frames(video_path, output_dir, refine_timestamps)
+        print(f"  Refine scan: {len(refine_frames)} frames ({CFG['refine_interval']}s interval around positives)")
+        refine_batch_id = submit_batch_for_frames(refine_frames, output_dir, "refine_batch", api_key)
+        save_progress(output_dir, {
+            "stage": "refine_submitted",
+            "batch_id": refine_batch_id,
+            "coarse_timestamps": progress.get("coarse_timestamps", []),
+            "refine_timestamps": refine_timestamps,
+            "yes_timestamps": coarse_yes,
+        })
+        print(f"  Refine batch submitted: {refine_batch_id}")
+        sys.exit("Refine batch submitted. Run the script again later to collect final results.")
+
+    if stage == "refine_submitted":
+        batch = openai_get_batch(batch_id, api_key)
+        status = batch.get("status")
+        if status != "completed":
+            sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
+
+        _, refine_yes = collect_yes_from_batch(batch_id, progress.get("refine_timestamps", []), api_key)
+        final_yes = sorted(refine_yes or [])
+        merged = merge(final_yes, CFG["min_gap"])
+        save_progress(output_dir, {
+            "stage": "complete",
+            "batch_id": batch_id,
+            "coarse_timestamps": progress.get("coarse_timestamps", []),
+            "refine_timestamps": progress.get("refine_timestamps", []),
+            "yes_timestamps": final_yes,
+        })
+        return merged
+
+    sys.exit(f"ERROR: Unknown progress stage: {stage}")
 
 
 def all_events(video_path, output_dir):
@@ -265,7 +517,7 @@ def multi_mode(input_dir, output_dir):
         print(f"  {mp4s[i].name}: offset {off:+.1f}s vs reference")
         offsets.append(off)
 
-    print("  Detecting events on reference camera with OpenAI Vision...")
+    print("  Detecting events on reference camera with OpenAI Vision Batch API...")
     events = all_events(mp4s[0], output_dir)
     print(f"  Events detected: {len(events)}")
 
