@@ -29,7 +29,7 @@ echo.
 set OUTPUT=output
 echo Running single-cam detection...
 echo.
-python process.py --input "%INPUT%" --output "%OUTPUT%"
+python process.py --input "%INPUT%" --output "%OUTPUT%" --watch
 goto done
 
 :multi
@@ -41,7 +41,7 @@ echo.
 set OUTPUT=output
 echo Running multi-cam detection with audio sync...
 echo.
-python process.py --input "%INPUT%" --output "%OUTPUT%" --multi
+python process.py --input "%INPUT%" --output "%OUTPUT%" --multi --watch
 goto done
 
 :done
