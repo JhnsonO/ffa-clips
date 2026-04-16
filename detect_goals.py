@@ -20,18 +20,15 @@ CFG = {
     "yolo_imgsz": 640,
     "ball_class": 32,
     "net_motion_threshold": 5.0,
-    "net_motion_cooldown": 2.0,
+    "net_motion_cooldown": 15.0,
     "vision_timeout_sec": 60,
 }
 
 GOAL_REGION_PROMPT = (
-    "You are analyzing a frame from a GoPro mounted behind a football goal, looking outward at the pitch.\n\n"
-    "The bottom portion of the image shows the goal net. The upper portion shows the pitch.\n\n"
-    "Return a JSON object with these fields:\n"
-    "- \"net_top_y\": the y-coordinate (as a fraction 0.0-1.0 from top of image) where the top edge of the goal net/crossbar is. Everything below this line is the net/goal area.\n"
-    "- \"ignore_below_y\": set this to 1.0 (we use the full frame height)\n"
-    "- \"halfway_x_left\": 0.0 (not used for now)\n"
-    "- \"halfway_x_right\": 1.0 (not used for now)\n\n"
+    "You are analyzing a frame from a GoPro camera mounted on the back of a football goal, looking outward at the pitch. The camera sees the crossbar and net in the lower portion of the frame, with the pitch and players above/beyond.\n\n"
+    "I need you to identify where the crossbar is in this image. The crossbar is the horizontal white bar that runs across the frame — it is the top edge of the goal net.\n\n"
+    "Return a JSON object with this field:\n"
+    "- \"net_top_y\": the y-coordinate as a fraction from 0.0 (top of image) to 1.0 (bottom of image) where the crossbar sits. Everything below this line is goal net. For a typical GoPro mounted behind a 7-a-side goal, this is usually between 0.40 and 0.55.\n\n"
     "Reply with ONLY the JSON object, no other text, no markdown backticks."
 )
 
@@ -145,6 +142,7 @@ def detect_goal_region(video_path, output_dir):
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
             if "net_top_y" in data:
+                print("  (delete output/goal_region.json to re-detect)")
                 return {"net_top_y": float(data["net_top_y"])}
         except Exception:
             pass
@@ -158,7 +156,7 @@ def detect_goal_region(video_path, output_dir):
         str(frame_path),
     ])
     if code != 0 or not frame_path.exists():
-        fallback = {"net_top_y": 0.55}
+        fallback = {"net_top_y": 0.48}
         cache_path.write_text(json.dumps(fallback, indent=2), encoding="utf-8")
         return fallback
 
@@ -177,7 +175,7 @@ def detect_goal_region(video_path, output_dir):
         "temperature": 0,
     }
 
-    fallback = {"net_top_y": 0.55}
+    fallback = {"net_top_y": 0.48}
     try:
         resp = openai_json_request("POST", "/v1/chat/completions", api_key, body)
         text = resp["choices"][0]["message"]["content"]
@@ -185,7 +183,7 @@ def detect_goal_region(video_path, output_dir):
         if isinstance(parsed, dict) and "net_top_y" in parsed:
             net_top_y = float(parsed["net_top_y"])
             if not (0.0 < net_top_y < 1.0):
-                net_top_y = 0.55
+                net_top_y = 0.48
             result = {"net_top_y": net_top_y}
         else:
             result = fallback
@@ -253,33 +251,49 @@ def detect_net_motion(frames, goal_region, frame_height):
     goal_top_px = int(goal_region["net_top_y"] * frame_height)
     hits = []
     triggered = []
+    rejected = []
     last_trigger_ts = -9999.0
-    prev_gray = None
+    prev_gray_blurred = None
 
     for idx, (timestamp, frame_path) in enumerate(frames, start=1):
         frame = cv2.imread(str(frame_path))
         if frame is None:
             continue
-        crop = frame[goal_top_px:, :]
-        if crop.size == 0:
-            continue
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
 
-        if prev_gray is not None:
-            diff = cv2.absdiff(prev_gray, gray)
-            mean_diff = float(np.mean(diff))
-            if mean_diff > CFG["net_motion_threshold"] and (timestamp - last_trigger_ts) >= CFG["net_motion_cooldown"]:
-                ts = round(float(timestamp), 3)
-                hits.append(ts)
-                triggered.append({"timestamp": ts, "mean_diff": round(mean_diff, 3)})
-                last_trigger_ts = timestamp
-        prev_gray = gray
+        if prev_gray_blurred is not None:
+            crop_prev = prev_gray_blurred[goal_top_px:, :]
+            crop_curr = gray_blurred[goal_top_px:, :]
+            if crop_prev.size != 0 and crop_curr.size != 0:
+                net_diff_img = cv2.absdiff(crop_prev, crop_curr)
+                net_diff = float(np.mean(net_diff_img))
+                full_diff_img = cv2.absdiff(prev_gray_blurred, gray_blurred)
+                full_diff = float(np.mean(full_diff_img))
+
+                if net_diff > CFG["net_motion_threshold"]:
+                    ts = round(float(timestamp), 3)
+                    if full_diff < net_diff * 0.6:
+                        if (timestamp - last_trigger_ts) >= CFG["net_motion_cooldown"]:
+                            hits.append(ts)
+                            triggered.append({
+                                "timestamp": ts,
+                                "net_diff": round(net_diff, 3),
+                                "full_diff": round(full_diff, 3),
+                            })
+                            last_trigger_ts = timestamp
+                    else:
+                        rejected.append({
+                            "timestamp": ts,
+                            "net_diff": round(net_diff, 3),
+                            "full_diff": round(full_diff, 3),
+                        })
+        prev_gray_blurred = gray_blurred
 
         if idx % 500 == 0:
             print(f"  Net motion progress: {idx}/{len(frames)} frames processed...")
 
-    return hits, triggered
+    return hits, triggered, rejected
 
 
 def merge(timestamps, gap):
@@ -366,10 +380,11 @@ def main():
     log_line(out, f"YOLO detections: count={len(ball_timestamps)} timestamps={ball_timestamps}")
 
     print("  Running net motion detection...")
-    motion_timestamps, motion_triggers = detect_net_motion(frames, goal_region, frame_height)
+    motion_timestamps, motion_triggers, rejected_motion = detect_net_motion(frames, goal_region, frame_height)
     print(f"  Net motion: {len(motion_timestamps)} triggers")
     log_line(out, f"Net motion detections: count={len(motion_timestamps)} timestamps={motion_timestamps}")
     log_line(out, f"Net motion trigger details: {motion_triggers}")
+    log_line(out, f"Net motion rejected (camera movement): count={len(rejected_motion)} timestamps={rejected_motion}")
 
     combined = sorted(ball_timestamps + motion_timestamps)
     events = merge_detections(ball_timestamps, motion_timestamps, CFG["min_gap"])
