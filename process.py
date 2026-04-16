@@ -117,6 +117,26 @@ def progress_path(output_dir):
     return output_dir / "progress.json"
 
 
+def log_path(output_dir):
+    return output_dir / "detection.log"
+
+
+def log_results_path(output_dir, stage_name):
+    return output_dir / f"{stage_name}_results.json"
+
+
+def reset_log(output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path(output_dir).write_text("", encoding="utf-8")
+
+
+def log_line(output_dir, message):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n"
+    with log_path(output_dir).open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
 def load_progress(output_dir):
     path = progress_path(output_dir)
     if not path.exists():
@@ -242,13 +262,15 @@ def batch_status_text(batch):
     return status
 
 
-def wait_for_batch_completion(batch_id, api_key, label, poll_seconds):
+def wait_for_batch_completion(batch_id, api_key, label, poll_seconds, output_dir):
     last_status = None
     while True:
         batch = openai_get_batch(batch_id, api_key)
         status = batch.get("status")
         if status != last_status:
-            print(f"  {label} batch status: {batch_status_text(batch)}")
+            msg = f"{label} batch status: {batch_status_text(batch)}"
+            print(f"  {msg}")
+            log_line(output_dir, msg)
             last_status = status
         if status == "completed":
             return batch
@@ -386,7 +408,7 @@ def parse_label(text):
     return "NO"
 
 
-def collect_hits_from_batch(batch_id, timestamps, api_key, allow_maybe=False):
+def collect_hits_from_batch(batch_id, timestamps, api_key, allow_maybe=False, output_dir=None, stage_name="stage"):
     batch = openai_get_batch(batch_id, api_key)
     status = batch.get("status")
     if status != "completed":
@@ -397,6 +419,8 @@ def collect_hits_from_batch(batch_id, timestamps, api_key, allow_maybe=False):
 
     content = openai_download_file(output_file_id, api_key)
     hits = []
+    counts = {"YES": 0, "MAYBE": 0, "NO": 0}
+    rows = []
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -417,8 +441,32 @@ def collect_hits_from_batch(batch_id, timestamps, api_key, allow_maybe=False):
         except:
             text = ""
         label = parse_label(text)
+        counts[label] = counts.get(label, 0) + 1
+        ts = float(timestamps[idx])
         if label == "YES" or (allow_maybe and label == "MAYBE"):
-            hits.append(float(timestamps[idx]))
+            hits.append(ts)
+        rows.append({
+            "timestamp": ts,
+            "label": label,
+            "response": text,
+        })
+
+    if output_dir is not None:
+        summary = {
+            "stage": stage_name,
+            "allow_maybe": allow_maybe,
+            "counts": counts,
+            "hit_count": len(hits),
+            "hit_timestamps": sorted(hits),
+            "rows": rows,
+        }
+        log_results_path(output_dir, stage_name).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        log_line(output_dir, f"{stage_name}: YES={counts.get('YES',0)} MAYBE={counts.get('MAYBE',0)} NO={counts.get('NO',0)} kept={len(hits)}")
+        if hits:
+            log_line(output_dir, f"{stage_name}: kept timestamps {sorted(hits)}")
+        else:
+            log_line(output_dir, f"{stage_name}: no timestamps kept")
+
     return status, sorted(hits)
 
 
@@ -427,12 +475,16 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
     progress = load_progress(output_dir)
 
     if progress and progress.get("stage") == "complete":
+        log_line(output_dir, f"Progress already complete. Returning {len(progress.get('yes_timestamps', []))} timestamps from progress.json")
         return merge(progress.get("yes_timestamps", []), CFG["min_gap"])
 
     if not progress:
+        reset_log(output_dir)
+        log_line(output_dir, f"Starting new detection run for {video_path}")
         coarse_frames = sample_frames(video_path, output_dir, CFG["coarse_interval"], "coarse")
         coarse_timestamps = [t for t, _ in coarse_frames]
         print(f"  Coarse scan: {len(coarse_frames)} frames ({CFG['coarse_interval']}s interval)")
+        log_line(output_dir, f"Coarse scan prepared {len(coarse_frames)} frames at {CFG['coarse_interval']}s interval")
         batch_id = submit_batch_for_frames(coarse_frames, output_dir, "coarse_batch", api_key, COARSE_VISION_PROMPT)
         save_progress(output_dir, {
             "stage": "coarse_submitted",
@@ -442,24 +494,34 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             "yes_timestamps": [],
         })
         print(f"  Coarse batch submitted: {batch_id}")
+        log_line(output_dir, f"Coarse batch submitted: {batch_id}")
         if not watch:
             sys.exit("Batch submitted. Run the script again later to collect results.")
-        wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds)
+        wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds, output_dir)
         progress = load_progress(output_dir)
 
     stage = progress.get("stage")
     batch_id = progress.get("batch_id")
+    log_line(output_dir, f"Resuming at stage={stage} batch_id={batch_id}")
 
     if stage == "coarse_submitted":
         if watch:
-            wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds)
+            wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds, output_dir)
         else:
             batch = openai_get_batch(batch_id, api_key)
             status = batch.get("status")
+            log_line(output_dir, f"Coarse batch polled without watch: {batch_status_text(batch)}")
             if status != "completed":
                 sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
 
-        _, coarse_hits = collect_hits_from_batch(batch_id, progress.get("coarse_timestamps", []), api_key, allow_maybe=True)
+        _, coarse_hits = collect_hits_from_batch(
+            batch_id,
+            progress.get("coarse_timestamps", []),
+            api_key,
+            allow_maybe=True,
+            output_dir=output_dir,
+            stage_name="coarse",
+        )
         coarse_hits = sorted(coarse_hits or [])
         if not coarse_hits:
             save_progress(output_dir, {
@@ -469,11 +531,13 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
                 "refine_timestamps": [],
                 "yes_timestamps": [],
             })
+            log_line(output_dir, "Coarse stage produced no hits. Detection complete with zero clips.")
             return []
 
         refine_timestamps = refine_timestamps_from_yes(coarse_hits, video_path)
         refine_frames = build_refine_frames(video_path, output_dir, refine_timestamps)
         print(f"  Refine scan: {len(refine_frames)} frames ({CFG['refine_interval']}s interval around positives)")
+        log_line(output_dir, f"Refine scan prepared {len(refine_frames)} frames from {len(coarse_hits)} coarse hits")
         refine_batch_id = submit_batch_for_frames(refine_frames, output_dir, "refine_batch", api_key, REFINE_VISION_PROMPT)
         save_progress(output_dir, {
             "stage": "refine_submitted",
@@ -483,23 +547,32 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             "yes_timestamps": coarse_hits,
         })
         print(f"  Refine batch submitted: {refine_batch_id}")
+        log_line(output_dir, f"Refine batch submitted: {refine_batch_id}")
         if not watch:
             sys.exit("Refine batch submitted. Run the script again later to collect final results.")
-        wait_for_batch_completion(refine_batch_id, api_key, "Refine", poll_seconds)
+        wait_for_batch_completion(refine_batch_id, api_key, "Refine", poll_seconds, output_dir)
         progress = load_progress(output_dir)
         stage = progress.get("stage")
         batch_id = progress.get("batch_id")
 
     if stage == "refine_submitted":
         if watch:
-            wait_for_batch_completion(batch_id, api_key, "Refine", poll_seconds)
+            wait_for_batch_completion(batch_id, api_key, "Refine", poll_seconds, output_dir)
         else:
             batch = openai_get_batch(batch_id, api_key)
             status = batch.get("status")
+            log_line(output_dir, f"Refine batch polled without watch: {batch_status_text(batch)}")
             if status != "completed":
                 sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
 
-        _, refine_yes = collect_hits_from_batch(batch_id, progress.get("refine_timestamps", []), api_key, allow_maybe=False)
+        _, refine_yes = collect_hits_from_batch(
+            batch_id,
+            progress.get("refine_timestamps", []),
+            api_key,
+            allow_maybe=False,
+            output_dir=output_dir,
+            stage_name="refine",
+        )
         final_yes = sorted(refine_yes or [])
         merged = merge(final_yes, CFG["min_gap"])
         save_progress(output_dir, {
@@ -509,6 +582,11 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             "refine_timestamps": progress.get("refine_timestamps", []),
             "yes_timestamps": final_yes,
         })
+        log_line(output_dir, f"Refine stage kept {len(final_yes)} raw timestamps; merged into {len(merged)} final events")
+        if merged:
+            log_line(output_dir, f"Final merged event timestamps: {merged}")
+        else:
+            log_line(output_dir, "No final merged events produced")
         return merged
 
     sys.exit(f"ERROR: Unknown progress stage: {stage}")
@@ -556,6 +634,7 @@ def single_mode(input_path, output_dir, watch=False, poll_seconds=30):
     output_dir.mkdir(parents=True, exist_ok=True)
     events = all_events(input_path, output_dir, watch=watch, poll_seconds=poll_seconds)
     print(f"  Events detected: {len(events)}")
+    log_line(output_dir, f"single_mode received {len(events)} final events")
 
     vid_dur = duration(input_path)
     clips = []
@@ -565,6 +644,7 @@ def single_mode(input_path, output_dir, watch=False, poll_seconds=30):
         name = f"{input_path.stem}_event{i+1:03d}_{int(t)}s.mp4"
         clips.append(make_meta(name, t, input_path.stem, i+1))
         print(f"  • {name}")
+    log_line(output_dir, f"Manifest clip count: {len(clips)}")
     return clips, {
         "mode": "single",
         "source_video": str(input_path.resolve()),
@@ -599,12 +679,14 @@ def multi_mode(input_dir, output_dir, watch=False, poll_seconds=30):
     print("  Detecting events on reference camera with OpenAI Vision Batch API...")
     events = all_events(mp4s[0], output_dir, watch=watch, poll_seconds=poll_seconds)
     print(f"  Events detected: {len(events)}")
+    log_line(output_dir, f"multi_mode received {len(events)} final events")
 
     clips = []
     for i, t in enumerate(events):
         name = f"multicam_event{i+1:03d}_{int(t)}s.mp4"
         clips.append(make_meta(name, t, "multi", i+1))
         print(f"  • {name}")
+    log_line(output_dir, f"Manifest clip count: {len(clips)}")
 
     return clips, {
         "mode": "multi",
@@ -642,6 +724,7 @@ def main():
         "clips": clips,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    log_line(out, f"manifest.json written with {len(clips)} clips")
     print(f"\n✓ Detection complete: {len(clips)} candidate clips")
     print(f"✓ Manifest written: {out / 'manifest.json'}")
     print("✓ Open review.html in your browser to review clips from source video.")
