@@ -9,7 +9,7 @@ Set OPENAI_API_KEY in your environment before running, or place it in a local
 openai_key.txt / openai_key.bat file as: set OPENAI_API_KEY=...
 """
 
-import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error, uuid
+import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error, uuid, time
 from pathlib import Path
 from datetime import datetime
 
@@ -236,6 +236,22 @@ def batch_status_text(batch):
     return status
 
 
+def wait_for_batch_completion(batch_id, api_key, label, poll_seconds):
+    last_status = None
+    while True:
+        batch = openai_get_batch(batch_id, api_key)
+        status = batch.get("status")
+        if status != last_status:
+            print(f"  {label} batch status: {batch_status_text(batch)}")
+            last_status = status
+        if status == "completed":
+            return batch
+        if status in {"failed", "cancelled", "expired"}:
+            raise RuntimeError(f"{label} batch ended with status: {batch_status_text(batch)}")
+        print(f"  Waiting {poll_seconds}s before checking again...")
+        time.sleep(poll_seconds)
+
+
 def sample_frames(video_path, output_dir, every_sec, prefix, width=512, quality=10):
     frames_dir = output_dir / f"_vision_frames_{prefix}"
     if frames_dir.exists():
@@ -384,7 +400,7 @@ def collect_yes_from_batch(batch_id, timestamps, api_key):
     return status, sorted(yes_times)
 
 
-def vision_events(video_path, output_dir):
+def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
     api_key = require_api_key()
     progress = load_progress(output_dir)
 
@@ -404,16 +420,22 @@ def vision_events(video_path, output_dir):
             "yes_timestamps": [],
         })
         print(f"  Coarse batch submitted: {batch_id}")
-        sys.exit("Batch submitted. Run the script again later to collect results.")
+        if not watch:
+            sys.exit("Batch submitted. Run the script again later to collect results.")
+        wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds)
+        progress = load_progress(output_dir)
 
     stage = progress.get("stage")
     batch_id = progress.get("batch_id")
 
     if stage == "coarse_submitted":
-        batch = openai_get_batch(batch_id, api_key)
-        status = batch.get("status")
-        if status != "completed":
-            sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
+        if watch:
+            wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds)
+        else:
+            batch = openai_get_batch(batch_id, api_key)
+            status = batch.get("status")
+            if status != "completed":
+                sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
 
         _, coarse_yes = collect_yes_from_batch(batch_id, progress.get("coarse_timestamps", []), api_key)
         coarse_yes = sorted(coarse_yes or [])
@@ -439,13 +461,21 @@ def vision_events(video_path, output_dir):
             "yes_timestamps": coarse_yes,
         })
         print(f"  Refine batch submitted: {refine_batch_id}")
-        sys.exit("Refine batch submitted. Run the script again later to collect final results.")
+        if not watch:
+            sys.exit("Refine batch submitted. Run the script again later to collect final results.")
+        wait_for_batch_completion(refine_batch_id, api_key, "Refine", poll_seconds)
+        progress = load_progress(output_dir)
+        stage = progress.get("stage")
+        batch_id = progress.get("batch_id")
 
     if stage == "refine_submitted":
-        batch = openai_get_batch(batch_id, api_key)
-        status = batch.get("status")
-        if status != "completed":
-            sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
+        if watch:
+            wait_for_batch_completion(batch_id, api_key, "Refine", poll_seconds)
+        else:
+            batch = openai_get_batch(batch_id, api_key)
+            status = batch.get("status")
+            if status != "completed":
+                sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
 
         _, refine_yes = collect_yes_from_batch(batch_id, progress.get("refine_timestamps", []), api_key)
         final_yes = sorted(refine_yes or [])
@@ -462,8 +492,8 @@ def vision_events(video_path, output_dir):
     sys.exit(f"ERROR: Unknown progress stage: {stage}")
 
 
-def all_events(video_path, output_dir):
-    return vision_events(video_path, output_dir)
+def all_events(video_path, output_dir, watch=False, poll_seconds=30):
+    return vision_events(video_path, output_dir, watch=watch, poll_seconds=poll_seconds)
 
 
 def make_meta(name, t, cam, idx):
@@ -499,10 +529,10 @@ def cross_correlate(s_a, s_b, sr, max_sec=300):
     return best / 10.0
 
 
-def single_mode(input_path, output_dir):
+def single_mode(input_path, output_dir, watch=False, poll_seconds=30):
     print(f"\n→ Single cam detect-only: {input_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    events = all_events(input_path, output_dir)
+    events = all_events(input_path, output_dir, watch=watch, poll_seconds=poll_seconds)
     print(f"  Events detected: {len(events)}")
 
     vid_dur = duration(input_path)
@@ -519,7 +549,7 @@ def single_mode(input_path, output_dir):
     }
 
 
-def multi_mode(input_dir, output_dir):
+def multi_mode(input_dir, output_dir, watch=False, poll_seconds=30):
     mp4s = sorted(list(input_dir.glob("*.mp4")) + list(input_dir.glob("*.MP4")))
     if len(mp4s) < 2:
         sys.exit("ERROR: Need at least 2 MP4 files in folder for --multi mode.")
@@ -545,7 +575,7 @@ def multi_mode(input_dir, output_dir):
         offsets.append(off)
 
     print("  Detecting events on reference camera with OpenAI Vision Batch API...")
-    events = all_events(mp4s[0], output_dir)
+    events = all_events(mp4s[0], output_dir, watch=watch, poll_seconds=poll_seconds)
     print(f"  Events detected: {len(events)}")
 
     clips = []
@@ -567,6 +597,8 @@ def main():
     ap.add_argument("--input", required=True, help="MP4 file (single) or folder (multi)")
     ap.add_argument("--output", default="output", help="Output folder (default: output/)")
     ap.add_argument("--multi", action="store_true", help="Multi-cam mode")
+    ap.add_argument("--watch", action="store_true", help="Stay open and poll batch progress until complete")
+    ap.add_argument("--poll-seconds", type=int, default=30, help="Seconds between status checks in --watch mode")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -575,11 +607,11 @@ def main():
     if args.multi:
         if not inp.is_dir():
             sys.exit("ERROR: --multi requires a folder as --input")
-        clips, source = multi_mode(inp, out)
+        clips, source = multi_mode(inp, out, watch=args.watch, poll_seconds=args.poll_seconds)
     else:
         if not inp.is_file():
             sys.exit("ERROR: --input must be a .mp4 file")
-        clips, source = single_mode(inp, out)
+        clips, source = single_mode(inp, out, watch=args.watch, poll_seconds=args.poll_seconds)
 
     manifest = {
         "generated": datetime.now().isoformat(),
