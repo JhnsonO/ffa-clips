@@ -35,9 +35,11 @@ COARSE_VISION_PROMPT = (
 )
 
 REFINE_VISION_PROMPT = (
-    "This is a frame from a 7-a-side football match near a possible highlight moment. "
-    "Does this frame show a clear football highlight or dangerous moment worth clipping, such as a goal, shot, clear chance, goalmouth action, celebration, strong tackle, interception, or obvious skill move? "
-    "Reply with only YES or NO."
+    "These are 3 consecutive frames roughly 2 seconds apart from a 7-a-side football match, "
+    "near a moment flagged as a possible highlight. Does this sequence show or suggest a football "
+    "highlight worth clipping — such as a goal, shot, clear chance, goalmouth action, celebration, "
+    "strong tackle, interception, or skill move? Reply with only YES or NO. "
+    "Lean towards YES if in doubt — false positives are acceptable, missed highlights are not."
 )
 
 
@@ -323,8 +325,8 @@ def refine_timestamps_from_yes(yes_times, video_path):
     times = []
     seen = set()
     for t in yes_times:
-        start = max(0, int(t - 30))
-        end = int(t + 30)
+        start = max(0, int(t - 10))
+        end = int(t + 10)
         cur = start
         while cur <= end:
             ts = round(float(cur), 3)
@@ -338,25 +340,70 @@ def refine_timestamps_from_yes(yes_times, video_path):
 
 
 def build_refine_frames(video_path, output_dir, timestamps):
+    """Build refine frames grouped into triplets for multi-frame context.
+
+    Returns list of (center_timestamp, [path1, path2, path3]) tuples.
+    Each triplet is 3 consecutive timestamps from the sorted list.
+    If fewer than 3 timestamps remain at the end, pad by repeating the last frame.
+    """
     frames_dir = output_dir / "_vision_frames_refine"
     if frames_dir.exists():
         for old in frames_dir.glob("*.jpg"):
             old.unlink(missing_ok=True)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    frames = []
+    frame_paths = []
     for i, ts in enumerate(timestamps):
         frame_path = frames_dir / f"refine_{i+1:06d}.jpg"
         sample_frame_at(video_path, ts, frame_path)
-        frames.append((ts, frame_path))
-    return frames
+        frame_paths.append((ts, frame_path))
+
+    triplets = []
+    for i in range(0, len(frame_paths), 3):
+        group = frame_paths[i:i+3]
+        while len(group) < 3:
+            group.append(group[-1])
+        center_ts = group[1][0]
+        paths = [g[1] for g in group]
+        triplets.append((center_ts, paths))
+
+    return triplets
 
 
 def build_batch_jsonl(frames, output_dir, name, prompt):
+    """Build JSONL for batch API.
+
+    frames can be either:
+    - list of (timestamp, frame_path) tuples — one image per request (coarse)
+    - list of (timestamp, [path1, path2, ...]) tuples — multiple images per request (refine)
+    """
     jsonl_path = output_dir / f"{name}.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as f:
-        for i, (ts, frame_path) in enumerate(frames):
-            b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+        for i, item in enumerate(frames):
+            ts = item[0]
+            frame_data = item[1]
+
+            if isinstance(frame_data, list):
+                image_blocks = []
+                for fp in frame_data:
+                    b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+                    image_blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "low",
+                        },
+                    })
+            else:
+                b64 = base64.b64encode(frame_data.read_bytes()).decode("ascii")
+                image_blocks = [{
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}",
+                        "detail": "low",
+                    },
+                }]
+
             req = {
                 "custom_id": f"{name}_{i:06d}",
                 "method": "POST",
@@ -368,14 +415,7 @@ def build_batch_jsonl(frames, output_dir, name, prompt):
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{b64}",
-                                        "detail": "low",
-                                    },
-                                },
-                            ],
+                            ] + image_blocks,
                         }
                     ],
                     "max_tokens": 5,
@@ -536,14 +576,15 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
 
         refine_timestamps = refine_timestamps_from_yes(coarse_hits, video_path)
         refine_frames = build_refine_frames(video_path, output_dir, refine_timestamps)
-        print(f"  Refine scan: {len(refine_frames)} frames ({CFG['refine_interval']}s interval around positives)")
-        log_line(output_dir, f"Refine scan prepared {len(refine_frames)} frames from {len(coarse_hits)} coarse hits")
+        refine_center_timestamps = [ts for ts, _ in refine_frames]
+        print(f"  Refine scan: {len(refine_frames)} triplets ({CFG['refine_interval']}s interval around positives)")
+        log_line(output_dir, f"Refine scan prepared {len(refine_frames)} triplets from {len(coarse_hits)} coarse hits")
         refine_batch_id = submit_batch_for_frames(refine_frames, output_dir, "refine_batch", api_key, REFINE_VISION_PROMPT)
         save_progress(output_dir, {
             "stage": "refine_submitted",
             "batch_id": refine_batch_id,
             "coarse_timestamps": progress.get("coarse_timestamps", []),
-            "refine_timestamps": refine_timestamps,
+            "refine_timestamps": refine_center_timestamps,
             "yes_timestamps": coarse_hits,
         })
         print(f"  Refine batch submitted: {refine_batch_id}")
