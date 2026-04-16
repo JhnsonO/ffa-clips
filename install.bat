@@ -43,6 +43,15 @@ if errorlevel 1 (
 )
 
 echo.
+echo Installing Python dependencies...
+pip install ultralytics opencv-python
+if errorlevel 1 (
+    echo [ERROR] Failed to install Python dependencies.
+    pause
+    exit /b 1
+)
+
+echo.
 echo ============================================
 echo  Setup complete! You can now run run.bat
 echo ============================================
