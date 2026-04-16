@@ -19,7 +19,7 @@ CFG = {
     "yolo_conf": 0.3,
     "yolo_imgsz": 640,
     "ball_class": 32,
-    "net_motion_threshold": 8.0,
+    "net_motion_threshold": 5.0,
     "net_motion_cooldown": 15.0,
     "vision_timeout_sec": 60,
     "goal_density_window_sec": 5.0,
@@ -248,6 +248,10 @@ def detect_ball_in_goal(frames, goal_region, frame_height, frame_width):
                     center_x = (x1 + x2) / 2.0
                     center_y = (y1 + y2) / 2.0
                     if center_y <= goal_top_px:
+                        continue
+                    box_w = x2 - x1
+                    box_h = y2 - y1
+                    if box_w < 25 or box_h < 25:
                         continue
                     hit = {
                         "timestamp": round(float(timestamp), 3),
