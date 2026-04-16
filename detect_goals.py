@@ -19,7 +19,7 @@ CFG = {
     "yolo_conf": 0.3,
     "yolo_imgsz": 640,
     "ball_class": 32,
-    "net_motion_threshold": 5.0,
+    "net_motion_threshold": 8.0,
     "net_motion_cooldown": 15.0,
     "vision_timeout_sec": 60,
 }
