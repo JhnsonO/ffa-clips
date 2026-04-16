@@ -514,6 +514,9 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
     api_key = require_api_key()
     progress = load_progress(output_dir)
 
+    if not watch:
+        watch = True
+
     if progress and progress.get("stage") == "complete":
         log_line(output_dir, f"Progress already complete. Returning {len(progress.get('yes_timestamps', []))} timestamps from progress.json")
         return merge(progress.get("yes_timestamps", []), CFG["min_gap"])
@@ -535,8 +538,6 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
         })
         print(f"  Coarse batch submitted: {batch_id}")
         log_line(output_dir, f"Coarse batch submitted: {batch_id}")
-        if not watch:
-            sys.exit("Batch submitted. Run the script again later to collect results.")
         wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds, output_dir)
         progress = load_progress(output_dir)
 
@@ -545,14 +546,7 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
     log_line(output_dir, f"Resuming at stage={stage} batch_id={batch_id}")
 
     if stage == "coarse_submitted":
-        if watch:
-            wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds, output_dir)
-        else:
-            batch = openai_get_batch(batch_id, api_key)
-            status = batch.get("status")
-            log_line(output_dir, f"Coarse batch polled without watch: {batch_status_text(batch)}")
-            if status != "completed":
-                sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
+        wait_for_batch_completion(batch_id, api_key, "Coarse", poll_seconds, output_dir)
 
         _, coarse_hits = collect_hits_from_batch(
             batch_id,
@@ -589,22 +583,13 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
         })
         print(f"  Refine batch submitted: {refine_batch_id}")
         log_line(output_dir, f"Refine batch submitted: {refine_batch_id}")
-        if not watch:
-            sys.exit("Refine batch submitted. Run the script again later to collect final results.")
         wait_for_batch_completion(refine_batch_id, api_key, "Refine", poll_seconds, output_dir)
         progress = load_progress(output_dir)
         stage = progress.get("stage")
         batch_id = progress.get("batch_id")
 
     if stage == "refine_submitted":
-        if watch:
-            wait_for_batch_completion(batch_id, api_key, "Refine", poll_seconds, output_dir)
-        else:
-            batch = openai_get_batch(batch_id, api_key)
-            status = batch.get("status")
-            log_line(output_dir, f"Refine batch polled without watch: {batch_status_text(batch)}")
-            if status != "completed":
-                sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
+        wait_for_batch_completion(batch_id, api_key, "Refine", poll_seconds, output_dir)
 
         _, refine_yes = collect_hits_from_batch(
             batch_id,
