@@ -5,7 +5,8 @@ FFA Clip Generator
     Multi cam:   python process.py --input folder/ --multi --output output/
 
 Detection uses OpenAI Vision via the Batch API.
-Set OPENAI_API_KEY in your environment before running.
+Set OPENAI_API_KEY in your environment before running, or place it in a local
+openai_key.txt / openai_key.bat file as: set OPENAI_API_KEY=...
 """
 
 import os, sys, json, argparse, subprocess, struct, wave, tempfile, base64, urllib.request, urllib.error, uuid
@@ -124,10 +125,36 @@ def save_progress(output_dir, data):
     progress_path(output_dir).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def load_api_key_from_file():
+    candidates = [
+        Path(__file__).resolve().parent / "openai_key.txt",
+        Path(__file__).resolve().parent / "openai_key.bat",
+        Path.cwd() / "openai_key.txt",
+        Path.cwd() / "openai_key.bat",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("::") or line.lower().startswith("rem "):
+                    continue
+                if line.lower().startswith("set "):
+                    line = line[4:].strip()
+                if line.startswith("OPENAI_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except:
+            pass
+    return None
+
+
 def require_api_key():
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY") or load_api_key_from_file()
     if not api_key:
-        sys.exit("ERROR: OPENAI_API_KEY is not set in the environment.")
+        sys.exit(
+            "ERROR: OPENAI_API_KEY is not set in the environment and no local openai_key.txt/openai_key.bat file was found."
+        )
     return api_key
 
 
