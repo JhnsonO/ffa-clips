@@ -5,7 +5,7 @@ echo FFA Clip Generator
 echo.
 echo Choose detection mode:
 echo   1. Vision highlight detection
-necho   2. Goal detection (local YOLO)
+echo   2. Goal detection (local YOLO)
 echo.
 set /p MODE="Enter mode (1 or 2): "
 
