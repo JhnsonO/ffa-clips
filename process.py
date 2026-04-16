@@ -28,10 +28,16 @@ CFG = {
     "refine_interval": 2,
 }
 
-VISION_PROMPT = (
+COARSE_VISION_PROMPT = (
     "This is a frame from a 7-a-side football match. "
-    "Does this frame show an exciting moment — a goal, shot, skill, tackle, or celebration? "
-    "Reply with just YES or NO."
+    "Does this frame show or strongly suggest any football highlight or dangerous moment, such as a goal, shot, shot build-up, clear chance, 1v1, goalmouth scramble, celebration, strong tackle, interception, dribble or skill? "
+    "Reply with only YES, MAYBE, or NO. Use MAYBE if it could be an attacking or defensive highlight but the frame alone is not fully conclusive."
+)
+
+REFINE_VISION_PROMPT = (
+    "This is a frame from a 7-a-side football match near a possible highlight moment. "
+    "Does this frame show a clear football highlight or dangerous moment worth clipping, such as a goal, shot, clear chance, goalmouth action, celebration, strong tackle, interception, or obvious skill move? "
+    "Reply with only YES or NO."
 )
 
 
@@ -324,7 +330,7 @@ def build_refine_frames(video_path, output_dir, timestamps):
     return frames
 
 
-def build_batch_jsonl(frames, output_dir, name):
+def build_batch_jsonl(frames, output_dir, name, prompt):
     jsonl_path = output_dir / f"{name}.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as f:
         for i, (ts, frame_path) in enumerate(frames):
@@ -339,7 +345,7 @@ def build_batch_jsonl(frames, output_dir, name):
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": VISION_PROMPT},
+                                {"type": "text", "text": prompt},
                                 {
                                     "type": "image_url",
                                     "image_url": {
@@ -350,7 +356,7 @@ def build_batch_jsonl(frames, output_dir, name):
                             ],
                         }
                     ],
-                    "max_tokens": 3,
+                    "max_tokens": 5,
                     "temperature": 0,
                 },
             }
@@ -358,14 +364,29 @@ def build_batch_jsonl(frames, output_dir, name):
     return jsonl_path
 
 
-def submit_batch_for_frames(frames, output_dir, name, api_key):
-    jsonl_path = build_batch_jsonl(frames, output_dir, name)
+def submit_batch_for_frames(frames, output_dir, name, api_key, prompt):
+    jsonl_path = build_batch_jsonl(frames, output_dir, name, prompt)
     upload = openai_upload_file(jsonl_path, api_key)
     batch = openai_create_batch(upload["id"], api_key)
     return batch["id"]
 
 
-def collect_yes_from_batch(batch_id, timestamps, api_key):
+def parse_label(text):
+    text = (text or "").strip().upper()
+    if text.startswith("YES"):
+        return "YES"
+    if text.startswith("MAYBE"):
+        return "MAYBE"
+    if text.startswith("NO"):
+        return "NO"
+    if "YES" in text:
+        return "YES"
+    if "MAYBE" in text:
+        return "MAYBE"
+    return "NO"
+
+
+def collect_hits_from_batch(batch_id, timestamps, api_key, allow_maybe=False):
     batch = openai_get_batch(batch_id, api_key)
     status = batch.get("status")
     if status != "completed":
@@ -375,7 +396,7 @@ def collect_yes_from_batch(batch_id, timestamps, api_key):
         raise RuntimeError("Batch completed but no output_file_id was returned.")
 
     content = openai_download_file(output_file_id, api_key)
-    yes_times = []
+    hits = []
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -392,12 +413,13 @@ def collect_yes_from_batch(batch_id, timestamps, api_key):
         body = ((row.get("response") or {}).get("body") or {})
         text = ""
         try:
-            text = body["choices"][0]["message"]["content"].strip().upper()
+            text = body["choices"][0]["message"]["content"]
         except:
             text = ""
-        if text.startswith("YES"):
-            yes_times.append(float(timestamps[idx]))
-    return status, sorted(yes_times)
+        label = parse_label(text)
+        if label == "YES" or (allow_maybe and label == "MAYBE"):
+            hits.append(float(timestamps[idx]))
+    return status, sorted(hits)
 
 
 def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
@@ -411,7 +433,7 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
         coarse_frames = sample_frames(video_path, output_dir, CFG["coarse_interval"], "coarse")
         coarse_timestamps = [t for t, _ in coarse_frames]
         print(f"  Coarse scan: {len(coarse_frames)} frames ({CFG['coarse_interval']}s interval)")
-        batch_id = submit_batch_for_frames(coarse_frames, output_dir, "coarse_batch", api_key)
+        batch_id = submit_batch_for_frames(coarse_frames, output_dir, "coarse_batch", api_key, COARSE_VISION_PROMPT)
         save_progress(output_dir, {
             "stage": "coarse_submitted",
             "batch_id": batch_id,
@@ -437,9 +459,9 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             if status != "completed":
                 sys.exit(f"Coarse batch status: {batch_status_text(batch)}. Run the script again later.")
 
-        _, coarse_yes = collect_yes_from_batch(batch_id, progress.get("coarse_timestamps", []), api_key)
-        coarse_yes = sorted(coarse_yes or [])
-        if not coarse_yes:
+        _, coarse_hits = collect_hits_from_batch(batch_id, progress.get("coarse_timestamps", []), api_key, allow_maybe=True)
+        coarse_hits = sorted(coarse_hits or [])
+        if not coarse_hits:
             save_progress(output_dir, {
                 "stage": "complete",
                 "batch_id": batch_id,
@@ -449,16 +471,16 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             })
             return []
 
-        refine_timestamps = refine_timestamps_from_yes(coarse_yes, video_path)
+        refine_timestamps = refine_timestamps_from_yes(coarse_hits, video_path)
         refine_frames = build_refine_frames(video_path, output_dir, refine_timestamps)
         print(f"  Refine scan: {len(refine_frames)} frames ({CFG['refine_interval']}s interval around positives)")
-        refine_batch_id = submit_batch_for_frames(refine_frames, output_dir, "refine_batch", api_key)
+        refine_batch_id = submit_batch_for_frames(refine_frames, output_dir, "refine_batch", api_key, REFINE_VISION_PROMPT)
         save_progress(output_dir, {
             "stage": "refine_submitted",
             "batch_id": refine_batch_id,
             "coarse_timestamps": progress.get("coarse_timestamps", []),
             "refine_timestamps": refine_timestamps,
-            "yes_timestamps": coarse_yes,
+            "yes_timestamps": coarse_hits,
         })
         print(f"  Refine batch submitted: {refine_batch_id}")
         if not watch:
@@ -477,7 +499,7 @@ def vision_events(video_path, output_dir, watch=False, poll_seconds=30):
             if status != "completed":
                 sys.exit(f"Refine batch status: {batch_status_text(batch)}. Run the script again later.")
 
-        _, refine_yes = collect_yes_from_batch(batch_id, progress.get("refine_timestamps", []), api_key)
+        _, refine_yes = collect_hits_from_batch(batch_id, progress.get("refine_timestamps", []), api_key, allow_maybe=False)
         final_yes = sorted(refine_yes or [])
         merged = merge(final_yes, CFG["min_gap"])
         save_progress(output_dir, {
