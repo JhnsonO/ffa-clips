@@ -1,0 +1,11 @@
+# Generated outputs
+output/
+
+# Local API key files
+openai_key.txt
+openai_key.bat
+openai_key.txt.txt
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
