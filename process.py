@@ -24,7 +24,7 @@ CFG = {
     "switch_interval": 3.0,
     "vision_sample_every": 5,
     "vision_timeout_sec": 60,
-    "coarse_interval": 15,
+    "coarse_interval": 5,
     "refine_interval": 2,
 }
 
