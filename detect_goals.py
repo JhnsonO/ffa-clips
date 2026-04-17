@@ -3,7 +3,7 @@ FFA Goal Detector (YOLO + Net Motion)
   python detect_goals.py --input video.mp4 --output output/
 """
 
-import os, sys, json, argparse, subprocess, base64, urllib.request, urllib.error
+import os, sys, json, argparse, subprocess, base64, urllib.request, urllib.error, time
 from pathlib import Path
 from datetime import datetime
 import cv2
@@ -27,6 +27,11 @@ CFG = {
     "goal_line_zone_frac": 0.58,
     "goal_center_margin_frac": 0.18,
     "goal_net_support_window_sec": 3.0,
+    "ai_review_enabled": True,
+    "ai_review_model": "gpt-4o-mini",
+    "ai_review_frames_per_event": 3,
+    "ai_review_frame_offsets": [-1.0, 0.0, 1.0],
+    "ai_review_detail": "low",
 }
 
 
@@ -36,6 +41,18 @@ GOAL_REGION_PROMPT = (
     "Return a JSON object with this field:\n"
     '- "net_top_y": the y-coordinate as a fraction from 0.0 (top of image) to 1.0 (bottom of image) where the crossbar sits. Everything below this line is goal net. For a typical GoPro mounted behind a 7-a-side goal, this is usually between 0.40 and 0.55.\n\n'
     "Reply with ONLY the JSON object, no other text, no markdown backticks."
+)
+
+AI_REVIEW_PROMPT = (
+    "You are reviewing footage from a GoPro camera mounted on the back of a football goal, looking outward at the pitch. The crossbar and net are visible in the lower portion of the frame.\n\n"
+    "These 3 frames are from approximately 1 second before, during, and 1 second after a possible goal event.\n\n"
+    "Did the ball enter the net in this sequence? Look for:\n"
+    "- A ball crossing the goal line (the crossbar) from the pitch side into the net\n"
+    "- The ball visible inside the net area\n"
+    "- Net movement or deformation suggesting a ball hit it\n\n"
+    "Reply with ONLY a JSON object:\n"
+    '{"goal": true/false, "confidence": "high"/"medium"/"low", "reason": "brief explanation"}\n\n'
+    "No markdown backticks, no other text."
 )
 
 
@@ -463,20 +480,126 @@ def classify_goal_events(events, ball_hits, motion_timestamps, goal_region, fram
     return kept, summaries, rejected
 
 
-def build_manifest(events, event_summaries, video_path, output_dir):
+def ai_review_goals(kept_events, event_summaries, frames, fps, output_dir):
+    if not kept_events:
+        log_line(output_dir, "AI review: reviewing 0 candidates")
+        log_line(output_dir, "AI review complete: 0 confirmed goals, 0 rejected")
+        return [], event_summaries, []
+
+    api_key = os.environ.get("OPENAI_API_KEY") or load_api_key_from_file()
+    if not api_key:
+        warning = "AI review: skipped (missing API key)"
+        print(f"[WARN] {warning}")
+        log_line(output_dir, warning)
+        return kept_events, event_summaries, []
+
+    log_line(output_dir, f"AI review: reviewing {len(kept_events)} candidates")
+
+    summary_by_time = {
+        round(float(item["event_time"]), 3): item
+        for item in event_summaries
+    }
+    confirmed_events = []
+    confirmed_summaries = []
+    ai_rejected = []
+
+    for idx, event_time in enumerate(kept_events, start=1):
+        event_key = round(float(event_time), 3)
+        summary = dict(summary_by_time.get(event_key, {"event_time": event_key}))
+        mins = int(event_time // 60)
+        secs = int(event_time % 60)
+        label = f"Goal {idx} @ {mins}:{secs:02d}"
+
+        try:
+            selected_frames = []
+            for offset in CFG["ai_review_frame_offsets"][:CFG["ai_review_frames_per_event"]]:
+                target_time = float(event_time) + float(offset)
+                nearest = min(frames, key=lambda item: abs(item[0] - target_time))
+                selected_frames.append(nearest)
+
+            content = [{"type": "text", "text": AI_REVIEW_PROMPT}]
+            for _, frame_path in selected_frames:
+                b64 = base64.b64encode(Path(frame_path).read_bytes()).decode("ascii")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}",
+                        "detail": CFG["ai_review_detail"],
+                    },
+                })
+
+            body = {
+                "model": CFG["ai_review_model"],
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 200,
+                "temperature": 0,
+            }
+            resp = openai_json_request("POST", "/v1/chat/completions", api_key, body)
+            text = resp["choices"][0]["message"]["content"]
+            parsed = parse_json_object(text)
+
+            if not isinstance(parsed, dict) or "goal" not in parsed:
+                reason = "invalid AI response, kept by fail-open"
+                summary["ai_review"] = "confirmed"
+                summary["ai_review_confidence"] = "unknown"
+                summary["ai_review_reason"] = reason
+                confirmed_events.append(event_key)
+                confirmed_summaries.append(summary)
+                print(f"  AI review: {idx}/{len(kept_events)} — {label} — goal (fail-open)")
+                log_line(output_dir, f"AI review [{event_key}]: goal=true, confidence=unknown, reason={reason}")
+            else:
+                goal_value = bool(parsed.get("goal"))
+                confidence = str(parsed.get("confidence", "unknown"))
+                reason = str(parsed.get("reason", ""))
+                log_line(output_dir, f"AI review [{event_key}]: goal={'true' if goal_value else 'false'}, confidence={confidence}, reason={reason}")
+                if goal_value:
+                    summary["ai_review"] = "confirmed"
+                    summary["ai_review_confidence"] = confidence
+                    summary["ai_review_reason"] = reason
+                    confirmed_events.append(event_key)
+                    confirmed_summaries.append(summary)
+                    print(f"  AI review: {idx}/{len(kept_events)} — {label} — goal ({confidence} confidence)")
+                else:
+                    rejected_summary = dict(summary)
+                    rejected_summary["ai_review"] = "rejected"
+                    rejected_summary["ai_review_confidence"] = confidence
+                    rejected_summary["ai_review_reason"] = reason
+                    ai_rejected.append(rejected_summary)
+                    print(f"  AI review: {idx}/{len(kept_events)} — {label} — not goal ({reason})")
+        except Exception as e:
+            reason = f"api error: {e}"
+            summary["ai_review"] = "confirmed"
+            summary["ai_review_confidence"] = "unknown"
+            summary["ai_review_reason"] = reason
+            confirmed_events.append(event_key)
+            confirmed_summaries.append(summary)
+            print(f"[WARN] AI review failed for {label}; keeping event ({e})")
+            log_line(output_dir, f"AI review [{event_key}]: goal=true, confidence=unknown, reason={reason}")
+
+        time.sleep(0.5)
+
+    log_line(output_dir, f"AI review complete: {len(confirmed_events)} confirmed goals, {len(ai_rejected)} rejected")
+    return confirmed_events, confirmed_summaries, ai_rejected
+
+
+def build_manifest(events, event_summaries, video_path, output_dir, ai_reviewed_events=None):
     clips = []
     stem = video_path.stem
     summary_by_time = {
         round(float(item["event_time"]), 3): item
         for item in event_summaries
     }
+    ai_reviewed_events = {
+        round(float(t), 3) for t in (ai_reviewed_events or [])
+    }
 
     for i, t in enumerate(events, start=1):
         mins = int(t // 60)
         secs = int(t % 60)
-        summary = summary_by_time.get(round(float(t), 3), {})
+        event_key = round(float(t), 3)
+        summary = summary_by_time.get(event_key, {})
         confidence = summary.get("confidence", "unknown")
-        clips.append({
+        clip = {
             "file": f"{stem}_goal{i:03d}_{int(t)}s.mp4",
             "event_time": round(float(t), 1),
             "start_sec": round(max(0.0, float(t) - CFG["clip_pre"]), 3),
@@ -488,7 +611,10 @@ def build_manifest(events, event_summaries, video_path, output_dir):
             "confidence": confidence,
             "score": summary.get("score"),
             "why_flagged": summary.get("reasons", []),
-        })
+        }
+        if event_key in ai_reviewed_events:
+            clip["ai_review"] = "confirmed"
+        clips.append(clip)
 
     manifest = {
         "generated": datetime.now().isoformat(),
@@ -568,12 +694,31 @@ def main():
     log_line(out, f"Rejected merged events after goal filter: {rejected_events}")
     log_line(out, f"Final kept goal candidates: {kept_events}")
 
-    build_manifest(kept_events, event_summaries, inp, out)
-    log_line(out, f"Manifest clip count: {len(kept_events)}")
+    heuristic_kept_events = list(kept_events)
+    confirmed_events = list(kept_events)
+    confirmed_summaries = list(event_summaries)
+    ai_rejected = []
+
+    if CFG["ai_review_enabled"]:
+        confirmed_events, confirmed_summaries, ai_rejected = ai_review_goals(
+            kept_events,
+            event_summaries,
+            frames,
+            CFG["sample_fps"],
+            out,
+        )
+        log_line(out, f"AI rejected events: {ai_rejected}")
+    else:
+        log_line(out, "AI review: skipped (disabled in config)")
+
+    build_manifest(confirmed_events, confirmed_summaries, inp, out, ai_reviewed_events=confirmed_events)
+    log_line(out, f"Manifest clip count: {len(confirmed_events)}")
 
     print(f"  Combined: {len(combined)} raw detections → {len(merged_events)} merged events")
-    print(f"  Goal filter kept: {len(kept_events)} / {len(merged_events)} merged events")
-    print(f"\n✓ Detection complete: {len(kept_events)} true-goal candidates")
+    print(f"  Heuristic candidates: {len(heuristic_kept_events)}")
+    print(f"  AI confirmed: {len(confirmed_events)}")
+    print(f"  AI rejected: {len(ai_rejected)}")
+    print(f"\n✓ Detection complete: {len(confirmed_events)} true-goal candidates")
     print(f"  YOLO detections: {len(ball_hits)}")
     print(f"  Net motion detections: {len(motion_timestamps)}")
     print(f"✓ Manifest written: {out / 'manifest.json'}")
