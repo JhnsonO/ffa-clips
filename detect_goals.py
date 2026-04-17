@@ -405,7 +405,7 @@ def summarise_goal_event(event_time, ball_hits, motion_timestamps, goal_region, 
     keep = (
         density_count >= CFG["goal_min_yolo_hits"] and (
             len(deep_central_hits) >= 1
-            or (density_count >= 4 and len(central_hits) >= 2)
+            or (density_count >= 4 and len(central_hits) >= 2 and len(deep_hits) >= 1)
             or (density_count >= 3 and len(deep_hits) >= 1 and net_support)
         )
     )
