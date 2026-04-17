@@ -29,9 +29,9 @@ CFG = {
     "goal_net_support_window_sec": 3.0,
     "ai_review_enabled": True,
     "ai_review_model": "gpt-4o-mini",
-    "ai_review_frames_per_event": 3,
-    "ai_review_frame_offsets": [-1.0, 0.0, 1.0],
-    "ai_review_detail": "low",
+    "ai_review_detail": "high",
+    "ai_review_window_sec": 5.0,
+    "ai_review_max_frames": 15,
 }
 
 
@@ -44,14 +44,23 @@ GOAL_REGION_PROMPT = (
 )
 
 AI_REVIEW_PROMPT = (
-    "You are reviewing footage from a GoPro camera mounted on the back of a football goal, looking outward at the pitch. The crossbar and net are visible in the lower portion of the frame.\n\n"
-    "These 3 frames are from approximately 1 second before, during, and 1 second after a possible goal event.\n\n"
-    "Did the ball enter the net in this sequence? Look for:\n"
-    "- A ball crossing the goal line (the crossbar) from the pitch side into the net\n"
-    "- The ball visible inside the net area\n"
-    "- Net movement or deformation suggesting a ball hit it\n\n"
+    "You are reviewing footage from a GoPro camera mounted on the back of a football goal, looking outward at the pitch. The crossbar and net are visible in the lower portion of the frame. The pitch and players are visible above/beyond the crossbar.\n\n"
+    "These frames span approximately 10 seconds around a possible goal event, shown in chronological order.\n\n"
+    "Your task: determine whether a GOAL was scored in this sequence. A goal means the ball crossed the goal line and entered the net.\n\n"
+    "Look carefully for:\n"
+    "- A ball traveling from the pitch side (above the crossbar) into the net area (below the crossbar)\n"
+    "- The ball visibly inside the net, especially sitting on the ground behind the goal line\n"
+    "- Sudden net deformation or movement caused by a ball striking it\n"
+    "- Player celebrations immediately after — arms raised, running away, teammates converging\n\n"
+    "Do NOT count as a goal:\n"
+    "- A shot that the goalkeeper saved or caught\n"
+    "- A ball that hit the post or crossbar and bounced away\n"
+    "- General play near the goal without the ball entering the net\n"
+    "- A ball sitting near the goal but not clearly inside the net\n\n"
     "Reply with ONLY a JSON object:\n"
-    '{"goal": true/false, "confidence": "high"/"medium"/"low", "reason": "brief explanation"}\n\n'
+    '{"goal": true, "confidence": "high", "reason": "ball visible in net at frame 7, celebrations follow"}\n'
+    "or\n"
+    '{"goal": false, "confidence": "high", "reason": "goalkeeper caught the ball, no net movement"}\n\n'
     "No markdown backticks, no other text."
 )
 
@@ -511,11 +520,48 @@ def ai_review_goals(kept_events, event_summaries, frames, fps, output_dir):
         label = f"Goal {idx} @ {mins}:{secs:02d}"
 
         try:
-            selected_frames = []
-            for offset in CFG["ai_review_frame_offsets"][:CFG["ai_review_frames_per_event"]]:
-                target_time = float(event_time) + float(offset)
-                nearest = min(frames, key=lambda item: abs(item[0] - target_time))
-                selected_frames.append(nearest)
+            window = CFG["ai_review_window_sec"]
+            window_frames = [
+                item for item in frames
+                if abs(float(item[0]) - float(event_time)) <= window
+            ]
+            window_frames = sorted(window_frames, key=lambda item: item[0])
+
+            if len(window_frames) < 3:
+                reason = "too few frames in review window, kept by fail-open"
+                summary["ai_review"] = "confirmed"
+                summary["ai_review_confidence"] = "unknown"
+                summary["ai_review_reason"] = reason
+                confirmed_events.append(event_key)
+                confirmed_summaries.append(summary)
+                print(f"  AI review: {idx}/{len(kept_events)} — {label} — goal (fail-open)")
+                log_line(output_dir, f"AI review [{event_key}]: {len(window_frames)} frames, goal=true, confidence=unknown, reason={reason}")
+                time.sleep(0.5)
+                continue
+
+            if len(window_frames) > CFG["ai_review_max_frames"]:
+                max_frames = CFG["ai_review_max_frames"]
+                selected_indices = np.linspace(0, len(window_frames) - 1, num=max_frames)
+                selected_indices = [int(round(i)) for i in selected_indices]
+                selected_indices[0] = 0
+                selected_indices[-1] = len(window_frames) - 1
+                deduped = []
+                seen = set()
+                for i in selected_indices:
+                    if i not in seen:
+                        deduped.append(i)
+                        seen.add(i)
+                if len(deduped) < max_frames:
+                    for i in range(len(window_frames)):
+                        if i not in seen:
+                            deduped.append(i)
+                            seen.add(i)
+                        if len(deduped) == max_frames:
+                            break
+                selected_indices = sorted(deduped[:max_frames])
+                selected_frames = [window_frames[i] for i in selected_indices]
+            else:
+                selected_frames = window_frames
 
             content = [{"type": "text", "text": AI_REVIEW_PROMPT}]
             for _, frame_path in selected_frames:
@@ -531,12 +577,13 @@ def ai_review_goals(kept_events, event_summaries, frames, fps, output_dir):
             body = {
                 "model": CFG["ai_review_model"],
                 "messages": [{"role": "user", "content": content}],
-                "max_tokens": 200,
+                "max_tokens": 300,
                 "temperature": 0,
             }
             resp = openai_json_request("POST", "/v1/chat/completions", api_key, body)
             text = resp["choices"][0]["message"]["content"]
             parsed = parse_json_object(text)
+            frame_count = len(selected_frames)
 
             if not isinstance(parsed, dict) or "goal" not in parsed:
                 reason = "invalid AI response, kept by fail-open"
@@ -546,12 +593,12 @@ def ai_review_goals(kept_events, event_summaries, frames, fps, output_dir):
                 confirmed_events.append(event_key)
                 confirmed_summaries.append(summary)
                 print(f"  AI review: {idx}/{len(kept_events)} — {label} — goal (fail-open)")
-                log_line(output_dir, f"AI review [{event_key}]: goal=true, confidence=unknown, reason={reason}")
+                log_line(output_dir, f"AI review [{event_key}]: {frame_count} frames, goal=true, confidence=unknown, reason={reason}")
             else:
                 goal_value = bool(parsed.get("goal"))
                 confidence = str(parsed.get("confidence", "unknown"))
                 reason = str(parsed.get("reason", ""))
-                log_line(output_dir, f"AI review [{event_key}]: goal={'true' if goal_value else 'false'}, confidence={confidence}, reason={reason}")
+                log_line(output_dir, f"AI review [{event_key}]: {frame_count} frames, goal={'true' if goal_value else 'false'}, confidence={confidence}, reason={reason}")
                 if goal_value:
                     summary["ai_review"] = "confirmed"
                     summary["ai_review_confidence"] = confidence
